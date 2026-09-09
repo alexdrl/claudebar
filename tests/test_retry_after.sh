@@ -72,7 +72,7 @@ STUB_BODY='{"error":{"type":"rate_limit_error","message":"Rate limited."}}' \
 assert_exit0          "429 + header: exit 0"
 assert_json_valid     "429 + header: valid JSON"
 assert_text_has       "429 + header: shows cached pct" "42%"
-assert_text_has       "429 + header: shows the pause mark" ""
+assert_text_has       "429 + header: shows the pause mark" ""
 assert_stale          "429 + header: .stale persisted"
 assert_marker_within  "429 + header: .retry_at ~990s ahead" 960 995
 assert_tip_has        "429 + header: tooltip reports the wait" "Retry at"
@@ -84,7 +84,7 @@ STUB_CODE=200 STUB_BODY="$FRESH" _run_ra old future
 assert_exit0       "live marker: exit 0"
 assert_json_valid  "live marker: valid JSON"
 assert_text_has    "live marker: serves the cache" "42%"
-assert_text_has    "live marker: shows the pause mark" ""
+assert_text_has    "live marker: shows the pause mark" ""
 assert_calls       "live marker: did NOT ask" 0
 rm -rf "$THOME"
 
