@@ -22,6 +22,15 @@
 #            See README "Structured JSON output".
 # --refresh  Bypass the 60s response cache and fetch fresh data from the API
 #            (the result still updates the cache for other instances).
+# --desktop-fallback
+#            When the API cannot answer, take the two main percentages from the
+#            local history of the Claude desktop app
+#            ($XDG_CONFIG_HOME/Claude/plan-usage-history.json) instead of
+#            showing the cache behind a pause mark. That app writes a sample
+#            every ~15 min while it runs, and its numbers come through its own
+#            session, so a rate limit on this token does not stop them. The
+#            file holds percentages only: a window from it has no reset time
+#            and no pacing. The footer of the tooltip names the source.
 # --tooltip-font FONT
 #            Font family (or Pango family list) the tooltip is pinned to.
 #            Default: "JetBrainsMono Nerd Font Mono, JetBrainsMono Nerd Font,
@@ -156,6 +165,7 @@ TOOLTIP_PACE_PTS=false
 TOOLTIP_FONT="JetBrainsMono Nerd Font, JetBrainsMono Nerd Font Mono, monospace"
 JSON_MODE=false
 FORCE_REFRESH=false
+DESKTOP_FALLBACK=false
 NO_COLOR_SET=false
 NO_COLOR_WHAT=""
 
@@ -242,6 +252,7 @@ while [[ $# -gt 0 ]]; do
         --tooltip-pace-pts) TOOLTIP_PACE_PTS=true; shift ;;
         --remaining) REMAINING=true; shift ;;
         --json) shift ;;  # already picked up by the pre-scan
+        --desktop-fallback) DESKTOP_FALLBACK=true; shift ;;
         --refresh) FORCE_REFRESH=true; shift ;;
         --no-color) NO_COLOR_SET=true; NO_COLOR_WHAT="all"; shift ;;
         --no-color=*)
@@ -296,6 +307,7 @@ PACE_TOLERANCE=$((10#$PACE_TOLERANCE))
 [[ "$REMAINING" == "true" && "$FORMAT_SET" == "false" ]] && FORMAT="{session_remaining_pct}% · {session_reset}"
 
 CREDS="$HOME/.claude/.credentials.json"
+DESKTOP_USAGE_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/Claude/plan-usage-history.json"
 API_URL="https://api.anthropic.com/api/oauth/usage"
 API_BASE_URL="https://api.anthropic.com"
 TOKEN_URL="https://platform.claude.com/v1/oauth/token"
@@ -324,6 +336,15 @@ MAX_RESP_BYTES=$((2 * 1024 * 1024)) # HTTP bodies; mirrors curl's --max-filesize
 # here, because it lands on the branch that already exists for a file that is
 # missing — no credits data — and it only triggers past 4 MiB of it.
 MAX_CLAUDE_JSON_BYTES=$((4 * 1024 * 1024))
+# The history of the Claude desktop app: one sample every ~15 min, a month of
+# them, 84 KiB on this machine. It grows, so it gets the same order of cap as
+# ~/.claude.json, and for the same reason: a truncated read makes jq fail and
+# the fallback degrade to "no sample", which is the branch that already exists
+# for a file that is not there.
+MAX_DESKTOP_USAGE_BYTES=$((4 * 1024 * 1024))
+# A sample older than this is used, but it keeps the pause mark: the app was
+# not running, so the number on the bar is not current. Two sampling periods.
+DESKTOP_SAMPLE_FRESH=1800
 
 # A file this script does not own can be replaced by a FIFO — reading one
 # blocks for ever — or by something enormous, which a shell variable would
@@ -415,6 +436,59 @@ writable_path() { # writable_path PATH
 # honour. Retry-After is a number of seconds OR an HTTP-date (RFC 9110); both
 # appear in the wild, so both are read. The value is clamped: a header is
 # foreign input, and an hour of silence is a bug, not a policy.
+# The two main percentages from the history of the Claude desktop app, shaped
+# like an answer of the API so that nothing downstream needs to know where the
+# numbers came from. Prints "<epoch seconds of the sample>TAB<json>", and
+# nothing at all when there is no usable sample.
+#
+# That file belongs to the desktop app, not to us, so it is read the way every
+# foreign file is: through read_bounded, and handed to jq on stdin instead of
+# letting jq open the path. A sample looks like
+#   {"t": <epoch ms>, "org": "<uuid>", "u": {"fh": 5, "sd": 67, "xu": 19.4}}
+# and only fh (the 5 h window) and sd (the 7 day window) are taken. The file
+# carries no reset time, and a window without one already renders as "—".
+_desktop_usage() {
+    local _raw _out
+    _raw=$(read_bounded "$DESKTOP_USAGE_FILE" "$MAX_DESKTOP_USAGE_BYTES") || return 1
+    read_was_truncated "$_raw" "$MAX_DESKTOP_USAGE_BYTES" && return 1
+    _out=$(jq -er '
+        (.samples // [])
+        | map(select((.t | type) == "number"
+                     and (.u.fh | type) == "number"
+                     and (.u.sd | type) == "number"))
+        | if length == 0 then error("no sample") else max_by(.t) end
+        | ((.t / 1000) | floor | tostring) + "\t"
+          + ({five_hour: {utilization: .u.fh},
+              seven_day: {utilization: .u.sd}} | tojson)
+    ' <<< "$_raw" 2>/dev/null) || return 1
+    [[ -n "$_out" ]] || return 1
+    printf '%s' "$_out"
+}
+
+# Put the numbers of the desktop app in front of a cache the API could not
+# refresh. Sets `usage` and returns 0 when it did. A sample that is not NEWER
+# than the cache is refused: old data with a source note is not better than old
+# data with a pause mark, and the API payload carries reset times that the
+# file does not.
+_try_desktop() {
+    [[ "$DESKTOP_FALLBACK" == "true" ]] || return 1
+    local _d _ts _payload _now _cache_ts
+    _d=$(_desktop_usage) || return 1
+    _ts="${_d%%$'\t'*}"
+    _payload="${_d#*$'\t'}"
+    [[ "$_ts" =~ ^[0-9]+$ && -n "$_payload" ]] || return 1
+    if [[ -f "$cache_file" ]]; then
+        _cache_ts=$(date -r "$cache_file" +%s 2>/dev/null) || _cache_ts=0
+        (( _ts > _cache_ts )) || return 1
+    fi
+    _now=$(date +%s)
+    usage="$_payload"
+    desktop_ts="$_ts"
+    desktop_source=true
+    if (( _now - _ts <= DESKTOP_SAMPLE_FRESH )); then desktop_fresh=true; else desktop_fresh=false; fi
+    return 0
+}
+
 _retry_after_seconds() { # _retry_after_seconds HEADER_BLOCK
     local _raw _secs _now
     _raw=$(printf '%s' "$1" | grep -i -m1 '^retry-after:' | tr -d '\r' \
@@ -1034,6 +1108,7 @@ _fetch_usage() {
             touch "$stale_marker" 2>/dev/null || true
             return
         fi
+        _try_desktop && return
         die "Rate limited.\nThe API asked to wait until $(date -d "@$_retry_at" +%H:%M)."
     fi
 
@@ -1147,6 +1222,7 @@ _fetch_usage() {
             fi
         fi
     else
+        _try_desktop && return
         die "API request failed.\nCheck your connection."
     fi
 }
@@ -1292,6 +1368,9 @@ expires_s=$(( expires_at / 1000 ))
 auth_ok=true
 refresh_failure_kind=""
 transient_stale=false
+desktop_source=false
+desktop_fresh=false
+desktop_ts=0
 
 [[ -n "$access_token" ]] || die "No token.\nRun <b>claude</b> to log in."
 
@@ -1429,6 +1508,13 @@ if [[ -n "$cred_tmp" ]]; then
 fi
 
 _fetch_usage
+# The API could not answer: the numbers may still be on disk, written by the
+# desktop app through its own session. Only the display changes — .stale and
+# .last_error keep saying what happened to the API.
+if [[ "$DESKTOP_FALLBACK" == "true" ]] \
+   && { [[ "${transient_stale:-false}" == "true" ]] || [[ -f "$stale_marker" ]] || [[ -z "$usage" ]]; }; then
+    _try_desktop || true
+fi
 _fetch_balance
 exec 9>&-
 
@@ -1842,9 +1928,19 @@ if [[ "$JSON_MODE" == "true" ]]; then
         # Future mtime (clock skew) must not leak a negative age.
         (( _json_age < 0 )) && _json_age=0
     fi
+    # A payload from the desktop app is dated by its SAMPLE, not by the cache
+    # file it replaced, and a recent sample is not stale data: it is current
+    # data from another source. An old sample keeps the reason it already has.
+    if [[ "$desktop_source" == "true" ]]; then
+        _json_updated=$(date -u -d "@$desktop_ts" +%Y-%m-%dT%H:%M:%SZ)
+        _json_age=$(( $(date +%s) - desktop_ts ))
+        (( _json_age < 0 )) && _json_age=0
+    fi
     _json_stale=false
     _json_stale_reason=""
-    if [[ "${transient_stale:-false}" == "true" ]]; then
+    if [[ "$desktop_source" == "true" && "$desktop_fresh" == "true" ]]; then
+        :
+    elif [[ "${transient_stale:-false}" == "true" ]]; then
         _json_stale=true; _json_stale_reason="network"
     elif [[ -f "$stale_marker" ]]; then
         _json_stale=true; _json_stale_reason="error"
@@ -2009,7 +2105,14 @@ format_model_remaining_bar=$(make_bar "$model_remaining_pct" "$model_color")
 
 # Stale data indicator
 stale_icon=""
-[[ -f "$stale_marker" || "${transient_stale:-false}" == "true" ]] && stale_icon=" "   # nf-fa-pause (U+23F8 renders as a color emoji)
+if [[ "$desktop_source" == "true" ]]; then
+    # The number on the bar came from the desktop app, so the pause mark —
+    # which says "this is the cache, the API did not answer" — would be a
+    # lie. It stays only when that sample is old as well.
+    [[ "$desktop_fresh" == "true" ]] || stale_icon=" " # nf-fa-pause (U+23F8 renders as a color emoji)
+elif [[ -f "$stale_marker" || "${transient_stale:-false}" == "true" ]]; then
+    stale_icon=" "
+fi
 
 bar_text=$(apply_format "$FORMAT")${stale_icon}
 
@@ -2037,12 +2140,25 @@ if [[ -f "$cache_file" ]]; then
     _updated=$(date -r "$cache_file" +%H:%M)
     _data_age=$(rel_age $(( $(date +%s) - $(date -r "$cache_file" +%s) )))
 fi
+if [[ "$desktop_source" == "true" ]]; then
+    _updated=$(date -d "@$desktop_ts" +%H:%M)
+    _data_age=$(rel_age $(( $(date +%s) - desktop_ts )))
+fi
 _stale_note=""
 # Suffix for the freshness footer. The footer always says when the data is
 # from; this only adds WHY it is not fresh, in the same words the Omarchy shell
 # panel uses.
 _stale_suffix=""
-if [[ "${transient_stale:-false}" == "true" ]]; then
+if [[ "$desktop_source" == "true" ]]; then
+    # Say the source. These numbers are as current as the desktop app is, and
+    # they carry no reset time, so the reader has to know where they are from.
+    _stale_note="  From the Claude desktop app — sample of ${_updated}${_data_age:+ (${_data_age})}"
+    if [[ "$desktop_fresh" == "true" ]]; then
+        _stale_suffix="<span foreground='${DIM}'> · from the desktop app</span>"
+    else
+        _stale_suffix="<span foreground='${ORANGE}'> · from the desktop app, and old</span>"
+    fi
+elif [[ "${transient_stale:-false}" == "true" ]]; then
     _stale_note="  Waiting for network — data from ${_updated}${_data_age:+ (${_data_age})}"
     _stale_suffix="<span foreground='${ORANGE}'> · stale (waiting for network)</span>"
 elif [[ -f "$stale_marker" ]]; then
